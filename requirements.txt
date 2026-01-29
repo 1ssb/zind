@@ -3,3 +3,7 @@ tqdm
 opencv-python
 numpy==1.18.4
 shapely==1.7.0
+
+# Perceptual hash filtering dependencies
+pillow>=8.0.0
+imagehash>=4.2.0
