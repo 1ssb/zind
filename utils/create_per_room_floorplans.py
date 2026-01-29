@@ -13,10 +13,10 @@ This script demonstrates how to extract per-room floorplans using these annotati
 import json
 import argparse
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import sys
+from PIL import Image, ImageDraw
 
 # Add code directory to path
 sys.path.append(str(Path(__file__).parent / "code"))
@@ -29,12 +29,14 @@ from utils import Polygon, PolygonType
 class PerRoomFloorPlanExtractor:
     """Extract per-room floorplans from ZInD data."""
     
-    def __init__(self, zind_json_path: str):
+    def __init__(self, zind_json_path: str, target_size: int = 512, meters_per_image: float = 10.0):
         """
         Initialize the extractor with a ZInD JSON file.
         
         Args:
             zind_json_path: Path to zind_data.json file
+            target_size: Size of output image in pixels (default: 512)
+            meters_per_image: Physical size to fit in the image in meters (default: 10)
         """
         self.zind_json_path = Path(zind_json_path)
         with open(zind_json_path) as f:
@@ -42,6 +44,11 @@ class PerRoomFloorPlanExtractor:
         
         # Parse using the provided FloorPlan class
         self.floor_plan = FloorPlan(zind_json_path)
+        
+        # Image rendering parameters
+        self.target_size = target_size
+        self.meters_per_image = meters_per_image
+        self.pixels_per_meter = target_size / meters_per_image  # 25.6 for 512/20
         
     def get_complete_rooms(self) -> Dict[str, Dict]:
         """
@@ -204,97 +211,136 @@ class PerRoomFloorPlanExtractor:
         
         return room_info
     
-    def visualize_room(
-        self, 
-        room_geometry: Dict,
-        output_path: Optional[str] = None,
-        show_wdo: bool = True
-    ):
+    def get_scale_factor(self, floor_id: str) -> Optional[float]:
         """
-        Visualize a single room's floorplan.
+        Get the scale factor (meters per coordinate unit) for a floor.
+        
+        Args:
+            floor_id: Floor identifier
+            
+        Returns:
+            Scale factor in meters per coordinate unit, or None if not available
+        """
+        if 'scale_meters_per_coordinate' in self.data:
+            return self.data['scale_meters_per_coordinate'].get(floor_id)
+        return None
+    
+    def render_room_binary(
+        self,
+        room_geometry: Dict,
+        floor_id: str,
+        output_path: Optional[str] = None
+    ) -> Tuple[Image.Image, Dict]:
+        """
+        Render a room as a binary image (black room on white background).
         
         Args:
             room_geometry: Room geometry dictionary from get_room_geometry()
-            output_path: Path to save the visualization (optional)
-            show_wdo: Whether to show windows/doors/openings
+            floor_id: Floor identifier for scale lookup
+            output_path: Path to save the image (optional)
+            
+        Returns:
+            Tuple of (PIL Image, metadata dict with scale info)
         """
-        fig, ax = plt.subplots(figsize=(10, 10))
+        if len(room_geometry['vertices']) == 0:
+            return None, {}
         
-        # Plot room vertices
-        if len(room_geometry['vertices']) > 0:
-            vertices = np.array(room_geometry['vertices'])
-            # Close the polygon
-            vertices_closed = np.vstack([vertices, vertices[0]])
-            ax.plot(vertices_closed[:, 0], vertices_closed[:, 1], 
-                   'k-', linewidth=2, label='Room boundary')
-            ax.fill(vertices_closed[:, 0], vertices_closed[:, 1], 
-                   alpha=0.1, color='gray')
+        # Get scale factor
+        scale_meters_per_coord = self.get_scale_factor(floor_id)
         
-        # Plot internal polygons (e.g., islands)
+        # Convert vertices to numpy array
+        vertices = np.array(room_geometry['vertices'])
+        
+        # Calculate bounding box
+        min_coords = vertices.min(axis=0)
+        max_coords = vertices.max(axis=0)
+        room_size_coords = max_coords - min_coords
+        
+        # Convert to meters if scale is available
+        if scale_meters_per_coord is not None:
+            room_size_meters = room_size_coords * scale_meters_per_coord
+        else:
+            # Assume coordinates are already in meters
+            room_size_meters = room_size_coords
+            scale_meters_per_coord = 1.0
+        
+        # Calculate actual pixels per meter based on room size
+        max_room_dimension = max(room_size_meters[0], room_size_meters[1])
+        
+        # Scale to fit within target image while maintaining aspect ratio
+        if max_room_dimension > self.meters_per_image:
+            # Room is larger than target - scale down
+            scale_factor = self.meters_per_image / max_room_dimension
+        else:
+            # Room is smaller - use standard scale
+            scale_factor = 1.0
+        
+        actual_pixels_per_meter = self.pixels_per_meter * scale_factor
+        
+        # Create white background image
+        img = Image.new('L', (self.target_size, self.target_size), color=255)
+        draw = ImageDraw.Draw(img)
+        
+        # Transform vertices to image coordinates
+        # Center the room in the image
+        center_offset = (self.target_size / 2, self.target_size / 2)
+        room_center_coords = (min_coords + max_coords) / 2
+        
+        def coord_to_pixel(coord):
+            """Convert room coordinate to pixel coordinate."""
+            # Translate to origin
+            translated = coord - room_center_coords
+            # Scale to meters then to pixels
+            scaled = translated * scale_meters_per_coord * actual_pixels_per_meter
+            # Flip Y axis (image Y is top-down) and translate to center
+            pixel_x = scaled[0] + center_offset[0]
+            pixel_y = center_offset[1] - scaled[1]  # Flip Y
+            return (pixel_x, pixel_y)
+        
+        # Draw main room polygon (black outline only, white fill)
+        pixel_vertices = [coord_to_pixel(v) for v in vertices]
+        # Draw with a reasonable wall thickness (e.g., 3 pixels)
+        wall_thickness = 3
+        
+        # First fill with white (floor)
+        draw.polygon(pixel_vertices, fill=255)
+        
+        # Then draw black outline (walls)
+        # Close the polygon by adding first vertex at the end
+        closed_vertices = pixel_vertices + [pixel_vertices[0]]
+        draw.line(closed_vertices, fill=0, width=wall_thickness)
+        
+        # Draw internal polygons if any (black walls)
         for internal in room_geometry.get('internal', []):
             internal_array = np.array(internal)
-            internal_closed = np.vstack([internal_array, internal_array[0]])
-            ax.plot(internal_closed[:, 0], internal_closed[:, 1], 
-                   'k-', linewidth=2)
-            ax.fill(internal_closed[:, 0], internal_closed[:, 1], 
-                   alpha=0.2, color='gray')
+            pixel_internal = [coord_to_pixel(v) for v in internal_array]
+            # Fill with white
+            draw.polygon(pixel_internal, fill=255)
+            # Draw black outline
+            closed_internal = pixel_internal + [pixel_internal[0]]
+            draw.line(closed_internal, fill=0, width=wall_thickness)
         
-        if show_wdo:
-            # Plot windows
-            windows = room_geometry.get('windows', [])
-            if len(windows) > 0:
-                windows_array = np.array(windows)
-                for i in range(0, len(windows_array), 2):
-                    ax.plot([windows_array[i, 0], windows_array[i+1, 0]], 
-                           [windows_array[i, 1], windows_array[i+1, 1]], 
-                           'b-', linewidth=4, label='Window' if i == 0 else '')
-            
-            # Plot doors
-            doors = room_geometry.get('doors', [])
-            if len(doors) > 0:
-                doors_array = np.array(doors)
-                for i in range(0, len(doors_array), 2):
-                    ax.plot([doors_array[i, 0], doors_array[i+1, 0]], 
-                           [doors_array[i, 1], doors_array[i+1, 1]], 
-                           'g-', linewidth=4, label='Door' if i == 0 else '')
-            
-            # Plot openings
-            openings = room_geometry.get('openings', [])
-            if len(openings) > 0:
-                openings_array = np.array(openings)
-                for i in range(0, len(openings_array), 2):
-                    ax.plot([openings_array[i, 0], openings_array[i+1, 0]], 
-                           [openings_array[i, 1], openings_array[i+1, 1]], 
-                           'r--', linewidth=4, label='Opening' if i == 0 else '')
-        
-        # Plot panorama positions
-        for pano in room_geometry['panos']:
-            if 'vertices' in pano:
-                # For visible layouts, we can show the pano-specific view
-                pass
-            # Could add camera positions here if needed
-        
-        ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        ax.set_title(f"Room: {room_geometry['label']}")
-        ax.set_xlabel('X coordinate')
-        ax.set_ylabel('Y coordinate')
-        
-        plt.tight_layout()
+        # Save metadata
+        metadata = {
+            'pixels_per_meter': float(actual_pixels_per_meter),
+            'meters_per_coordinate': float(scale_meters_per_coord),
+            'room_size_meters': room_size_meters.tolist(),
+            'room_size_coords': room_size_coords.tolist(),
+            'image_size_pixels': self.target_size,
+            'target_meters_per_image': self.meters_per_image,
+            'scale_factor_applied': float(scale_factor)
+        }
         
         if output_path:
-            plt.savefig(output_path, dpi=150, bbox_inches='tight')
-            print(f"Saved visualization to {output_path}")
-        else:
-            plt.show()
+            img.save(output_path)
+            print(f"Saved: {output_path} (scale: {actual_pixels_per_meter:.2f} px/m)")
         
-        plt.close()
+        return img, metadata
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract and visualize per-room floorplans from ZInD dataset"
+        description="Extract per-room floorplans as binary images from ZInD dataset"
     )
     parser.add_argument(
         "-i", "--input",
@@ -304,7 +350,7 @@ def main():
     parser.add_argument(
         "-o", "--output-dir",
         default="per_room_floorplans",
-        help="Output directory for visualizations"
+        help="Output directory for images"
     )
     parser.add_argument(
         "--layout-type",
@@ -320,6 +366,18 @@ def main():
         "--room",
         help="Specific room to process (e.g., complete_room_01)"
     )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=512,
+        help="Output image size in pixels (default: 512)"
+    )
+    parser.add_argument(
+        "--meters-per-image",
+        type=float,
+        default=10.0,
+        help="Physical size to fit in image in meters (default: 10)"
+    )
     
     args = parser.parse_args()
     
@@ -329,23 +387,33 @@ def main():
     
     # Initialize extractor
     print(f"Loading ZInD data from {args.input}")
-    extractor = PerRoomFloorPlanExtractor(args.input)
+    print(f"Image size: {args.image_size}x{args.image_size} pixels")
+    print(f"Target scale: {args.meters_per_image}m = {args.image_size}px")
+    print(f"Pixels per meter: {args.image_size/args.meters_per_image:.2f}")
+    
+    extractor = PerRoomFloorPlanExtractor(
+        args.input, 
+        target_size=args.image_size,
+        meters_per_image=args.meters_per_image
+    )
     
     # Get all complete rooms
     complete_rooms = extractor.get_complete_rooms()
     
     print(f"\nLayout type: {args.layout_type}")
-    print(f"Available layouts per panorama:")
-    print(f"  - layout_raw: Raw annotated room from a single panorama")
-    print(f"  - layout_complete: Complete merged room (all partial observations)")
-    print(f"  - layout_visible: Only geometry visible from panorama viewpoint")
+    
+    # Metadata for all rooms
+    all_metadata = {}
     
     # Process rooms
     for floor_id, rooms in complete_rooms.items():
         if args.floor and floor_id != args.floor:
             continue
         
-        print(f"\n{floor_id}: {len(rooms)} complete rooms")
+        # Extract floor number from floor_id (e.g., "floor_01" -> "1")
+        floor_num = floor_id.split('_')[-1].lstrip('0') or '0'
+        
+        print(f"\n{floor_id} (Floor {floor_num}): {len(rooms)} complete rooms")
         
         for complete_room_id in rooms:
             if args.room and complete_room_id != args.room:
@@ -358,16 +426,47 @@ def main():
                 args.layout_type
             )
             
-            print(f"  {complete_room_id}: {room_geometry['label']}")
-            print(f"    Panoramas: {len(room_geometry['panos'])}")
-            if len(room_geometry['vertices']) > 0:
-                print(f"    Vertices: {len(room_geometry['vertices'])}")
+            if len(room_geometry['vertices']) == 0:
+                print(f"  {complete_room_id}: {room_geometry['label']} - SKIPPED (no vertices)")
+                continue
             
-            # Create visualization
-            output_path = output_dir / f"{floor_id}_{complete_room_id}_{args.layout_type}.png"
-            extractor.visualize_room(room_geometry, str(output_path))
+            # Create clean room label (replace spaces with underscores, lowercase)
+            room_label = room_geometry['label'].replace(' ', '_').lower()
+            room_id = complete_room_id.split('_')[-1]
+            
+            # Better filename: floor_number_roomlabel_roomid.png
+            filename = f"{floor_num}_{room_label}_{room_id}.png"
+            output_path = output_dir / filename
+            
+            # Render binary image
+            img, metadata = extractor.render_room_binary(
+                room_geometry, 
+                floor_id,
+                str(output_path)
+            )
+            
+            # Store metadata
+            all_metadata[filename] = {
+                'floor_id': floor_id,
+                'floor_number': int(floor_num),
+                'complete_room_id': complete_room_id,
+                'room_label': room_geometry['label'],
+                'num_panos': len(room_geometry['panos']),
+                'num_vertices': len(room_geometry['vertices']),
+                **metadata
+            }
+            
+            print(f"  {complete_room_id}: {room_geometry['label']}")
+            print(f"    Saved as: {filename}")
     
-    print(f"\nVisualizations saved to {output_dir}")
+    # Save metadata JSON
+    metadata_path = output_dir / "metadata.json"
+    with open(metadata_path, 'w') as f:
+        json.dump(all_metadata, f, indent=2)
+    
+    print(f"\nProcessed {len(all_metadata)} rooms")
+    print(f"Images saved to: {output_dir}")
+    print(f"Metadata saved to: {metadata_path}")
 
 
 if __name__ == "__main__":

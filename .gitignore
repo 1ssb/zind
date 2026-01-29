@@ -1,0 +1,33 @@
+# Ignore local dataset contents
+/data/
+
+# Ignore generated floorplan outputs
+/per_room_floorplans*/
+floorplans/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+/logs/
+
+# OS
+.DS_Store
+Thumbs.db
